@@ -1,0 +1,15 @@
+schema_version = "1.0.0"
+
+id = "game_asset_utility"
+version = "1.22.0"
+name = "GameAssetUtility"
+tagline = "A Blender extension for streamlining game asset workflows"
+maintainer = "daondare"
+type = "add-on"
+
+# Targets Blender 5.1 and newer only.
+blender_version_min = "5.1.0"
+
+license = [
+    "SPDX:GPL-3.0-or-later",
+]

@@ -1,17 +1,7 @@
-bl_info = {
-    "name": "GameAssetUtility",
-    "author": "daondare",
-    "version": (1, 22, 0),
-    "blender": (3, 0, 0),
-    "location": "View3D > Sidebar > GameAssetUtility",
-    "description": (
-        "Game asset utility — folder-structure templating, bake-asset prep "
-        "(modifier stack, vertex colors, materials), batched FBX export of "
-        "bake passes (low/cage/trans/painter), and per-asset rigged FBX "
-        "export for game engines"
-    ),
-    "category": "System",
-}
+# Addon metadata (name, version, maintainer, etc.) lives in
+# blender_manifest.toml at the root of the extension package — bl_info has
+# been removed because it is replaced by the manifest in the Blender 5.1
+# extension format.
 
 # ─────────────────────────────────────────────────────────────────────────────
 # RENAME RISK — internal identifier prefix
@@ -2943,11 +2933,11 @@ active preset (the 'Default' preset is protected and cannot be removed)"""
 
 class CPF_OT_PackageZip(Operator):
     """Create a distributable GameAssetUtility.zip in the configured ZIP
-output folder. Install via Edit > Preferences > Add-ons > Install.
+output folder, structured as a Blender 5.1 extension package.
 
-NOTE: the zip's internal folder is GameAssetUtility/, so installing it adds
-a new addon module named GameAssetUtility — disable any older install of
-this addon (originally named CreateProjectFolders) after switching"""
+The zip is FLAT: blender_manifest.toml and every .py file sit at the root
+of the archive (no nesting subfolder), as required by Blender's extension
+installer (Edit > Preferences > Get Extensions > Install from Disk)"""
     bl_idname = "cpf.package_zip"
     bl_label = "Package as .zip"
     bl_options = {"REGISTER"}
@@ -2959,12 +2949,16 @@ this addon (originally named CreateProjectFolders) after switching"""
         zip_path = os.path.join(out_dir, "GameAssetUtility.zip")
 
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            # blender_manifest.toml MUST be present at the root of the archive
+            # for the extension installer to recognize the package.
+            manifest_path = os.path.join(addon_dir, "blender_manifest.toml")
+            if os.path.isfile(manifest_path):
+                zf.write(manifest_path, "blender_manifest.toml")
+            # Every .py module sits at the root alongside the manifest —
+            # the extension format expects a flat layout, no nesting folder.
             for fname in os.listdir(addon_dir):
                 if fname.endswith(".py"):
-                    zf.write(
-                        os.path.join(addon_dir, fname),
-                        os.path.join("GameAssetUtility", fname),
-                    )
+                    zf.write(os.path.join(addon_dir, fname), fname)
 
         self.report({"INFO"}, f"Saved: {zip_path}")
         return {"FINISHED"}
