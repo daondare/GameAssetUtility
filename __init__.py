@@ -3038,7 +3038,7 @@ class CPF_OT_UpdateAddon(Operator):
 _PT_BASE = {
     "bl_space_type": "VIEW_3D",
     "bl_region_type": "UI",
-    "bl_category": "GameAssetUtility",
+    "bl_category": "GAU",
     "bl_options": {"DEFAULT_CLOSED"},
 }
 
