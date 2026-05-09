@@ -1788,6 +1788,91 @@ class CPF_OT_ToggleExportModVisibility(Operator):
         return {"FINISHED"}
 
 
+class CPF_OT_AddCageVertexGroup(Operator):
+    """Adds a CAGE vertex group to all mesh objects in the collection and assigns it to any Displace modifiers"""
+    bl_idname = "cpf.add_cage_vertex_group"
+    bl_label = "Add Vertex Group"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        settings = context.scene.cpf_settings
+        coll = settings.bake_collection
+        if not coll:
+            self.report({"ERROR"}, "Select a collection first")
+            return {"CANCELLED"}
+
+        added = 0
+        skipped = 0
+        displace_assigned = 0
+        for obj in coll.objects:
+            if obj.type != "MESH":
+                continue
+            # Add CAGE vertex group if missing; otherwise leave as-is.
+            vg = obj.vertex_groups.get("CAGE")
+            if vg is None:
+                vg = obj.vertex_groups.new(name="CAGE")
+                added += 1
+            else:
+                skipped += 1
+            # Assign to every Displace modifier on the object.
+            for m in obj.modifiers:
+                if m.type == "DISPLACE":
+                    try:
+                        m.vertex_group = "CAGE"
+                        displace_assigned += 1
+                    except (RuntimeError, AttributeError):
+                        pass
+
+        self.report(
+            {"INFO"},
+            f"CAGE vertex group: added on {added}, already present on {skipped}, "
+            f"assigned to {displace_assigned} Displace modifier(s)",
+        )
+        return {"FINISHED"}
+
+
+class CPF_OT_ClearCageVertexGroup(Operator):
+    """Removes the CAGE vertex group from all mesh objects in the collection and clears it from any Displace modifiers"""
+    bl_idname = "cpf.clear_cage_vertex_group"
+    bl_label = "Clear Vertex Group"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        settings = context.scene.cpf_settings
+        coll = settings.bake_collection
+        if not coll:
+            self.report({"ERROR"}, "Select a collection first")
+            return {"CANCELLED"}
+
+        removed = 0
+        cleared_modifiers = 0
+        for obj in coll.objects:
+            if obj.type != "MESH":
+                continue
+            # Clear CAGE assignment from every Displace modifier first so
+            # we don't leave stale references after the vgroup is gone.
+            for m in obj.modifiers:
+                if m.type == "DISPLACE":
+                    try:
+                        if getattr(m, "vertex_group", "") == "CAGE":
+                            m.vertex_group = ""
+                            cleared_modifiers += 1
+                    except (RuntimeError, AttributeError):
+                        pass
+            # Remove the CAGE vertex group if present; skip silently otherwise.
+            vg = obj.vertex_groups.get("CAGE")
+            if vg is not None:
+                obj.vertex_groups.remove(vg)
+                removed += 1
+
+        self.report(
+            {"INFO"},
+            f"CAGE vertex group: removed from {removed} mesh(es), "
+            f"cleared from {cleared_modifiers} Displace modifier(s)",
+        )
+        return {"FINISHED"}
+
+
 class CPF_OT_SetVertexColor(Operator):
     """Add a default white (1, 1, 1, 1) vertex color attribute to every MESH object
 in the shared collection. Skips meshes that already have one"""
@@ -3336,10 +3421,16 @@ class CPF_PT_SetupBakeAssets(Panel):
         body.separator(factor=1.0)
 
         # ── Sub-section: Add Bake Modifiers (always visible) ──────────────
+        # All four modifier-related elements (preset row, Add Bake Modifiers
+        # button, modifier stack collapsible, CAGE vertex-group row) are
+        # wrapped in a single outer body.box() so they form one visually
+        # unified group, mirroring the Rename Mesh Objects pattern above
+        # (label header outside, everything else inside the box).
         body.label(text="Add Bake Modifiers", icon="MODIFIER")
+        box = body.box()
 
-        # Preset row — mirrors the FBX / Naming preset UI
-        preset_row = body.row(align=True)
+        # 1. Preset row — mirrors the FBX / Naming preset UI
+        preset_row = box.row(align=True)
         preset_row.menu(
             "CPF_MT_BakeMods_Presets",
             text=CPF_MT_BakeMods_Presets.bl_label,
@@ -3351,14 +3442,14 @@ class CPF_PT_SetupBakeAssets(Panel):
             "cpf.bake_mods_preset_add", text="", icon="REMOVE",
         ).remove_active = True
 
-        # Add Bake Modifiers button (always visible, above the stack)
-        btn_box = body.box()
+        # 2. Add Bake Modifiers button (always visible, above the stack)
+        btn_box = box.box()
         row = btn_box.row()
         row.scale_y = 1.4
         row.operator("cpf.add_bake_modifiers", icon="MODIFIER_ON")
 
-        # Collapsible stack
-        stack_header = body.row()
+        # 3. Modifier stack collapsible
+        stack_header = box.row()
         stack_header.prop(
             settings, "show_bake_modifier_stack",
             icon="TRIA_DOWN" if settings.show_bake_modifier_stack else "TRIA_RIGHT",
@@ -3367,7 +3458,7 @@ class CPF_PT_SetupBakeAssets(Panel):
         stack_header.label(text="Modifier Stack")
 
         if settings.show_bake_modifier_stack:
-            stack_box = body.box()
+            stack_box = box.box()
 
             # Add-modifier row: categorized columns Menu (mirrors
             # Blender's native Add Modifier menu) + a refresh-cache
@@ -3426,6 +3517,12 @@ class CPF_PT_SetupBakeAssets(Panel):
                             col.prop(
                                 item, d["field_name"], text=d["name"],
                             )
+
+        # 4. CAGE vertex-group helpers (side-by-side row, always visible)
+        row = box.row(align=True)
+        row.scale_y = 1.4
+        row.operator("cpf.add_cage_vertex_group", icon="GROUP_VERTEX")
+        row.operator("cpf.clear_cage_vertex_group", icon="X")
 
         body.separator(factor=1.0)
 
@@ -3704,6 +3801,8 @@ classes = (
     CPF_OT_BakeModRemove,
     CPF_OT_BakeModMove,
     CPF_OT_ToggleExportModVisibility,
+    CPF_OT_AddCageVertexGroup,
+    CPF_OT_ClearCageVertexGroup,
     CPF_OT_SetVertexColor,
     CPF_OT_SetMaterial,
     CPF_OT_ExportBakeAssets,
