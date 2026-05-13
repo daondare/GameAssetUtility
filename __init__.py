@@ -365,19 +365,27 @@ def _categorize_modifier(mod_type_id):
 
 def _post_register_mesh_filter():
     """Run the mesh-compatibility test (now that bpy.data is unrestricted)
-    and prune _MODIFIER_CATEGORY_CACHE in place. Called once via a timer
-    scheduled from register(). The dynamic CPF_BakeModifierItem class
-    keeps fields for the wider set since it can't be safely re-registered
-    at runtime; only the dropdown list is filtered."""
+    and prune _MODIFIER_CATEGORY_CACHE in place, then discover and merge
+    addon-registered "fake" modifier operators (e.g. Edit Mesh Modifier).
+    Called once via a timer scheduled from register(). The dynamic
+    CPF_BakeModifierItem class keeps fields for the wider real-modifier
+    set since it can't be safely re-registered at runtime; only the
+    dropdown list is filtered. Fake modifiers don't need fields because
+    they expose no editable settings through our UI."""
     try:
         mesh_compatible = _build_mesh_compatible_modifier_set()
     except Exception as e:
         print(f"[GameAssetUtility] Post-register mesh filter failed: {e}")
-        return None  # one-shot
-    for cat, types in list(_MODIFIER_CATEGORY_CACHE.items()):
-        _MODIFIER_CATEGORY_CACHE[cat] = [
-            t for t in types if t in mesh_compatible
-        ]
+        mesh_compatible = None
+    if mesh_compatible is not None:
+        for cat, types in list(_MODIFIER_CATEGORY_CACHE.items()):
+            _MODIFIER_CATEGORY_CACHE[cat] = [
+                t for t in types if t in mesh_compatible
+            ]
+    try:
+        _merge_fake_modifier_operators()
+    except Exception as e:
+        print(f"[GameAssetUtility] Fake-modifier discovery failed: {e}")
     return None  # one-shot
 
 
@@ -459,6 +467,200 @@ def _modifier_class_map():
                 except TypeError:
                     pass
     return result
+
+
+# ── Addon-registered "fake" modifier discovery ────────────────────────────────
+# Some addons (e.g. Edit Mesh Modifier / EMM) register a new modifier-like
+# operator and inject it into Blender's category sub-menus
+# (OBJECT_MT_modifier_add_edit / _generate / _deform). They don't add a new
+# entry to bpy.types.Modifier's `type` enum — they add a NODES modifier with
+# a specific node group at apply time. To surface these in our Add Modifier
+# dropdown alongside real Blender modifier types, we render the category
+# menus' APPENDED draw functions into a mock layout, capture every
+# layout.operator(...) call, and keep entries whose poll() accepts a mesh
+# context. The cached type identifier for these fake modifiers is
+# "OP:<bl_idname>" (e.g. "OP:object.emm_add_modifier"); _apply_stack_to_object
+# branches on this prefix and invokes the operator under a temp context
+# override instead of calling obj.modifiers.new().
+
+
+class _MockOpReturn:
+    """Stand-in for the BPyOpsSubMod return of layout.operator(...). Any
+    attribute set/get is silently swallowed so chains like
+    `layout.operator(...).some_prop = val` are no-ops during simulation."""
+    def __setattr__(self, name, value):
+        pass
+
+    def __getattr__(self, name):
+        return self
+
+    def __call__(self, *a, **kw):
+        return self
+
+
+class _MockMenuLayout:
+    """Captures `layout.operator(bl_idname, text, icon)` calls during menu
+    draw simulation. Every other UILayout method is a no-op that returns
+    self so chained calls (`layout.row().column().separator()`) don't crash.
+    Attribute writes (`layout.use_property_split = True`) are swallowed."""
+
+    def __init__(self, capture):
+        object.__setattr__(self, "_capture", capture)
+
+    def operator(self, bl_idname, text="", icon="NONE", **kwargs):
+        self._capture.append((bl_idname, text, icon))
+        return _MockOpReturn()
+
+    def __getattr__(self, name):
+        layout = self
+
+        def _noop(*args, **kwargs):
+            return layout
+
+        return _noop
+
+    def __setattr__(self, name, value):
+        pass
+
+
+class _MockMenuSelf:
+    """Stand-in for the Menu instance passed as `self` to draw functions."""
+    def __init__(self, layout):
+        object.__setattr__(self, "layout", layout)
+
+    def __setattr__(self, name, value):
+        pass
+
+
+class _MockActiveObject:
+    """Minimum surface for draw fns that check `context.active_object.type
+    == 'MESH'` (the most common gate). Unknown attribute reads return None."""
+    type = "MESH"
+    name = "__cpf_mock_mesh"
+    mode = "OBJECT"
+
+    def __getattr__(self, name):
+        return None
+
+
+class _MockMenuContext:
+    """Mock context with a fake MESH active object for menu draw probing."""
+    active_object = _MockActiveObject()
+    object = _MockActiveObject()
+
+    def __getattr__(self, name):
+        return None
+
+
+_ADDON_MODIFIER_CATEGORY_MENUS = (
+    ("OBJECT_MT_modifier_add_edit",     "Edit"),
+    ("OBJECT_MT_modifier_add_generate", "Generate"),
+    ("OBJECT_MT_modifier_add_deform",   "Deform"),
+)
+
+
+def _discover_addon_modifier_operators():
+    """Render the Edit / Generate / Deform category menus' APPENDED draw
+    functions (those installed by third-party addons via menu.append())
+    into a mock layout and return the list of
+    (bl_idname, display_text, icon, category) tuples captured.
+
+    Native menu draw is NOT invoked — only the appended fns — so we don't
+    double-count entries that come through `object.modifier_add`. Returned
+    entries are still filtered: only operators in the `object.*` namespace
+    that aren't `object.modifier_add` itself are kept."""
+    found = []
+    mock_context = _MockMenuContext()
+
+    for menu_name, category in _ADDON_MODIFIER_CATEGORY_MENUS:
+        menu_cls = getattr(bpy.types, menu_name, None)
+        if menu_cls is None:
+            continue
+        # `_dyn_ui_initialize()` returns the list of appended draw funcs.
+        # Private but has been stable since Blender 2.8.
+        try:
+            appended = list(menu_cls._dyn_ui_initialize())
+        except Exception:
+            continue
+        for fn in appended:
+            capture = []
+            mock_self = _MockMenuSelf(_MockMenuLayout(capture))
+            try:
+                fn(mock_self, mock_context)
+            except Exception:
+                # Draw fn failed under the mock context — skip it.
+                continue
+            for bl_idname, text, icon in capture:
+                if not bl_idname or not bl_idname.startswith("object."):
+                    continue
+                if bl_idname == "object.modifier_add":
+                    continue
+                found.append((bl_idname, text, icon, category))
+    return found
+
+
+def _is_fake_modifier_op_mesh_compatible(bl_idname, tmp_obj):
+    """Return True if the addon-add operator's poll accepts a context
+    whose active object is `tmp_obj` (a temporary MESH)."""
+    try:
+        module_name, op_name = bl_idname.split(".", 1)
+    except ValueError:
+        return False
+    op_module = getattr(bpy.ops, module_name, None)
+    if op_module is None:
+        return False
+    op = getattr(op_module, op_name, None)
+    if op is None:
+        return False
+    try:
+        with bpy.context.temp_override(
+            active_object=tmp_obj, object=tmp_obj,
+            selected_objects=[tmp_obj],
+            selected_editable_objects=[tmp_obj],
+        ):
+            return bool(op.poll())
+    except Exception:
+        return False
+
+
+def _merge_fake_modifier_operators():
+    """Discover addon-registered modifier-add operators, test each against
+    a temporary throwaway mesh's poll, and merge passing ones into the
+    cache dicts with type identifier `OP:<bl_idname>`. Requires
+    bpy.data to be available — call only from post-register timer or the
+    refresh-cache operator, NEVER from register() itself."""
+    discovered = _discover_addon_modifier_operators()
+    if not discovered:
+        return
+
+    tmp_mesh = bpy.data.meshes.new("__cpf_tmp_op_pollmesh")
+    tmp_obj = bpy.data.objects.new("__cpf_tmp_op_pollobj", tmp_mesh)
+    try:
+        for bl_idname, text, icon, category in discovered:
+            type_id = "OP:" + bl_idname
+            if type_id in _MODIFIER_DISPLAY_NAMES:
+                # Already merged on a previous pass — skip duplicates.
+                continue
+            if not _is_fake_modifier_op_mesh_compatible(bl_idname, tmp_obj):
+                continue
+            # Fake modifiers have no editable properties in our cache — the
+            # operator handles all configuration internally. The UI's
+            # per-item draw renders an "(applied with default settings)"
+            # label for stack items with an empty descriptor list.
+            _MODIFIER_PROPERTY_CACHE[type_id] = []
+            _MODIFIER_DISPLAY_NAMES[type_id] = text or bl_idname
+            if category not in _MODIFIER_CATEGORY_CACHE:
+                _MODIFIER_CATEGORY_CACHE[category] = []
+            _MODIFIER_CATEGORY_CACHE[category].append(type_id)
+    finally:
+        try:
+            bpy.data.objects.remove(tmp_obj, do_unlink=True)
+        except Exception:
+            pass
+        try:
+            bpy.data.meshes.remove(tmp_mesh, do_unlink=True)
+        except Exception:
+            pass
 
 
 def _safe_int_clamp(v):
@@ -825,18 +1027,92 @@ def _populate_default_modifier_stack(settings):
 def _apply_stack_to_object(stack, obj):
     """Append a Blender modifier per stack item to `obj.modifiers`, copying
     every cached editable property value from the item onto the new modifier.
-    Modifier types not present in the cache (e.g. third-party ones registered
-    after this session started) are still added — Blender will use its own
-    defaults for their settings since we have no cached field mapping for
-    them. Returns the number of modifiers appended."""
-    count = 0
+
+    Per-item dedup guard: if a modifier with the same name as the stack
+    item already exists on the object, skip that item (idempotent re-apply).
+    Names are tracked in a local set so newly-added items also block
+    duplicates within the same call.
+
+    Two code paths based on the stack item's `modifier_type`:
+
+    1. **Real Blender modifier type** (e.g. "TRIANGULATE", "SUBSURF") —
+       calls `obj.modifiers.new(name=..., type=...)` and copies every
+       cached editable property value onto the new modifier.
+
+    2. **Addon-registered fake modifier** (`OP:<bl_idname>`, e.g.
+       "OP:object.emm_add_modifier") — invokes the addon's add-operator
+       under a `temp_override` that makes `obj` the active mesh. The
+       operator handles all internal setup (UUID stamps, node groups,
+       per-modifier state). After the call we diff `obj.modifiers` to
+       discover the actual name the operator gave the new modifier and,
+       on first apply when it differs from the stack item's default,
+       update the stack item's `modifier_name` so visibility lookup
+       downstream matches by name.
+
+    Modifier types not present in the cache are still added — Blender
+    will use its own defaults for their settings since we have no
+    cached field mapping for them. Returns (added_count, skipped_count)."""
+    added = 0
+    skipped = 0
+    existing_names = {m.name for m in obj.modifiers}
     for item in stack:
         type_id = item.modifier_type
+        target_name = item.modifier_name or type_id.title()
+        if target_name in existing_names:
+            # A modifier with this exact name is already on the object —
+            # skip to avoid adding an auto-renamed duplicate ("Triangulate"
+            # → "Triangulate.001"), preserving idempotent re-apply.
+            skipped += 1
+            continue
+
+        if type_id.startswith("OP:"):
+            # Fake modifier — invoke the addon's add-operator instead of
+            # obj.modifiers.new(...). The operator handles all internal
+            # setup that calling modifiers.new() would bypass.
+            op_bl_idname = type_id[3:]
+            try:
+                module_name, op_name = op_bl_idname.split(".", 1)
+            except ValueError:
+                continue
+            op_module = getattr(bpy.ops, module_name, None)
+            if op_module is None:
+                continue
+            op_callable = getattr(op_module, op_name, None)
+            if op_callable is None:
+                continue
+            before = {m.name for m in obj.modifiers}
+            try:
+                with bpy.context.temp_override(
+                    active_object=obj, object=obj,
+                    selected_objects=[obj],
+                    selected_editable_objects=[obj],
+                ):
+                    op_callable()
+            except Exception:
+                continue
+            new_names = {m.name for m in obj.modifiers} - before
+            if not new_names:
+                # Operator returned without adding a modifier (e.g. its
+                # poll refused, or it's incompatible with this mesh in a
+                # subtle way). Count as a skip rather than an error.
+                skipped += 1
+                continue
+            actual_name = next(iter(new_names))
+            # Sync the stack item's name to the operator's chosen name so
+            # downstream visibility lookup (which matches modifier-by-name)
+            # finds the right modifier on the target.
+            if actual_name != target_name:
+                try:
+                    item.modifier_name = actual_name
+                except Exception:
+                    pass
+            existing_names |= new_names
+            added += 1
+            continue
+
+        # Real Blender modifier type — original path.
         try:
-            new_mod = obj.modifiers.new(
-                name=item.modifier_name or type_id.title(),
-                type=type_id,
-            )
+            new_mod = obj.modifiers.new(name=target_name, type=type_id)
         except Exception:
             # Modifier type not valid for this object type — skip
             continue
@@ -851,8 +1127,9 @@ def _apply_stack_to_object(stack, obj):
                 # Setting failed (read-only at runtime, value out of range,
                 # removed property in this Blender version) — skip silently.
                 pass
-        count += 1
-    return count
+        existing_names.add(new_mod.name)
+        added += 1
+    return added, skipped
 
 
 class CPF_Settings(PropertyGroup):
@@ -1618,15 +1895,20 @@ shared collection, in stack order, with the stored per-modifier settings"""
             return {"CANCELLED"}
 
         mesh_count = 0
+        total_added = 0
+        total_skipped = 0
         for obj in coll.objects:
             if obj.type != "MESH":
                 continue
-            _apply_stack_to_object(stack, obj)
+            added, skipped = _apply_stack_to_object(stack, obj)
+            total_added += added
+            total_skipped += skipped
             mesh_count += 1
 
         self.report(
             {"INFO"},
-            f"Added {len(stack)} modifier(s) to {mesh_count} mesh(es)",
+            f"Added {total_added} modifier(s) to {mesh_count} mesh(es), "
+            f"skipped {total_skipped} already present",
         )
         return {"FINISHED"}
 
@@ -1674,6 +1956,10 @@ registered PropertyGroup at runtime is not supported by Blender's RNA"""
 
     def execute(self, context):
         _build_modifier_caches()
+        try:
+            _merge_fake_modifier_operators()
+        except Exception as e:
+            print(f"[GameAssetUtility] Fake-modifier discovery failed: {e}")
         n = sum(len(v) for v in _MODIFIER_CATEGORY_CACHE.values())
         self.report({"INFO"}, f"Refreshed cache — {n} modifier types known")
         return {"FINISHED"}
@@ -1789,7 +2075,9 @@ class CPF_OT_ToggleExportModVisibility(Operator):
 
 
 class CPF_OT_AddCageVertexGroup(Operator):
-    """Adds a CAGE vertex group to all mesh objects in the collection and assigns it to any Displace modifiers"""
+    """Adds a CAGE vertex group to all mesh objects in the collection (with
+weight 1.0 on every vertex when newly created or empty) and assigns it to
+any Displace modifiers. Existing hand-edited weights are preserved"""
     bl_idname = "cpf.add_cage_vertex_group"
     bl_label = "Add Vertex Group"
     bl_options = {"REGISTER", "UNDO"}
@@ -1802,18 +2090,41 @@ class CPF_OT_AddCageVertexGroup(Operator):
             return {"CANCELLED"}
 
         added = 0
-        skipped = 0
+        weighted = 0
+        preserved = 0
         displace_assigned = 0
         for obj in coll.objects:
             if obj.type != "MESH":
                 continue
-            # Add CAGE vertex group if missing; otherwise leave as-is.
+            # Add CAGE vertex group if missing; otherwise reuse it.
             vg = obj.vertex_groups.get("CAGE")
-            if vg is None:
+            newly_created = vg is None
+            if newly_created:
                 vg = obj.vertex_groups.new(name="CAGE")
                 added += 1
+
+            # Guard: only set every-vertex-weight=1.0 when the group was
+            # newly created OR exists but has no vertex assignments yet.
+            # If any vertex already has a weight in CAGE, leave all
+            # weights alone to preserve hand-edited values.
+            mesh = obj.data
+            has_existing_weights = False
+            if not newly_created:
+                for v in mesh.vertices:
+                    if any(g.group == vg.index for g in v.groups):
+                        has_existing_weights = True
+                        break
+
+            if not has_existing_weights:
+                vg.add(
+                    list(range(len(mesh.vertices))),
+                    1.0,
+                    "REPLACE",
+                )
+                weighted += 1
             else:
-                skipped += 1
+                preserved += 1
+
             # Assign to every Displace modifier on the object.
             for m in obj.modifiers:
                 if m.type == "DISPLACE":
@@ -1825,7 +2136,8 @@ class CPF_OT_AddCageVertexGroup(Operator):
 
         self.report(
             {"INFO"},
-            f"CAGE vertex group: added on {added}, already present on {skipped}, "
+            f"CAGE: created on {added} mesh(es), weighted on {weighted}, "
+            f"preserved existing on {preserved}, "
             f"assigned to {displace_assigned} Displace modifier(s)",
         )
         return {"FINISHED"}
@@ -2111,8 +2423,8 @@ permanent state are never altered"""
         # carried on each modifier (set by Add Bake Modifiers / preset load).
         passes = (
             ("export_suffix_low",     "origin", "low"),
-            ("export_suffix_cage",    None,     "cage"),
-            ("export_suffix_trans",   None,     "trans"),
+            ("export_suffix_cage",    "origin", "cage"),
+            ("export_suffix_trans",   "origin", "trans"),
             ("export_suffix_painter", "spread", "painter"),
         )
 
@@ -2179,9 +2491,13 @@ permanent state are never altered"""
                 # to the captured `world_origins` rather than a pass-local
                 # snapshot.
                 saved_visibility = _save_all_mod_visibility(mesh_objs)
-                if transform_kind == "origin":
-                    saved_locations = _save_object_locations(mesh_objs)
-                elif transform_kind == "spread":
+                # All position-touching passes ("origin" snap and
+                # "spread" layout) restore to the single world_origins
+                # snapshot captured at the start of the operator. This
+                # gives every pass the same "previous position before we
+                # started exporting" restore target, so a previous pass
+                # failing to restore can't leak into the next one.
+                if transform_kind in ("origin", "spread"):
                     saved_locations = world_origins
                 else:
                     saved_locations = None
