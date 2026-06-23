@@ -1826,8 +1826,63 @@ Each asset name replaces {assets} in the template"""
             self.report({"WARNING"}, "No folder paths found — add non-comment lines to the template")
             return {"CANCELLED"}
 
+        direct_paths = []
+        staged_paths = {}
         for rel in all_paths:
-            (root / rel).mkdir(parents=True, exist_ok=True)
+            rel_path = Path(rel)
+            parts = rel_path.parts
+            if rel_path.is_absolute() or not parts or ".." in parts:
+                direct_paths.append(rel_path)
+                continue
+
+            top_name = parts[0]
+            if (root / top_name).exists():
+                direct_paths.append(rel_path)
+            else:
+                staged_paths.setdefault(top_name, []).append(rel_path)
+
+        for rel_path in direct_paths:
+            (root / rel_path).mkdir(parents=True, exist_ok=True)
+
+        if staged_paths:
+            staging_root = None
+            for i in range(100):
+                candidate = root / f".gau_staging_{os.getpid()}_{i}"
+                try:
+                    candidate.mkdir()
+                except FileExistsError:
+                    continue
+                staging_root = candidate
+                break
+
+            if staging_root is None:
+                self.report({"ERROR"}, f"Could not create staging folder in {root}")
+                return {"CANCELLED"}
+
+            try:
+                for rel_paths in staged_paths.values():
+                    for rel_path in rel_paths:
+                        (staging_root / rel_path).mkdir(parents=True, exist_ok=True)
+
+                for top_name, rel_paths in staged_paths.items():
+                    src = staging_root / top_name
+                    dst = root / top_name
+                    try:
+                        src.rename(dst)
+                    except FileExistsError:
+                        for rel_path in rel_paths:
+                            (root / rel_path).mkdir(parents=True, exist_ok=True)
+                    except OSError:
+                        if not dst.exists():
+                            raise
+                        for rel_path in rel_paths:
+                            (root / rel_path).mkdir(parents=True, exist_ok=True)
+            except Exception as e:
+                self.report({"ERROR"}, f"Could not create folders: {e}")
+                return {"CANCELLED"}
+            finally:
+                if staging_root.exists():
+                    shutil.rmtree(staging_root, ignore_errors=True)
 
         self.report({"INFO"}, f"Created {len(all_paths)} folder(s) in {root}")
         return {"FINISHED"}
